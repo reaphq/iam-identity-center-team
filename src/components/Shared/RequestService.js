@@ -153,6 +153,7 @@ export async function getSessionList() {
   try {
     do {
     const request = await API.graphql(graphqlOperation(listRequests, {
+      limit: 1000,
       nextToken
     }));
     data = data.concat(request.data.listRequests.items);
@@ -201,7 +202,7 @@ export async function sessions(filter) {
   try {
     do {
     const request = await API.graphql(
-      graphqlOperation(listRequests, { filter: filter, nextToken })
+      graphqlOperation(listRequests, { filter: filter, limit: 1000, nextToken })
     );
     data = data.concat(request.data.listRequests.items);
     nextToken = request.data.listRequests.nextToken;
