@@ -22,7 +22,8 @@ import {
   listGroups,
   getSettings,
   getMgmtPermissions,
-  getUserPolicy
+  getUserPolicy,
+  requestByStatus
 } from "../../graphql/queries";
 import {
   createRequests,
@@ -166,6 +167,43 @@ export async function getSessionList() {
   }
 }
 
+// Query the requests table by `status` using the byStatus GSI instead of
+// scanning the whole table via listRequests. `status` may be a single value
+// or an array of statuses (each queried and merged). This keeps reads scoped
+// to the small, current status partitions (e.g. pending / in progress).
+// An optional `filter` is passed through to AppSync so it is applied by
+// DynamoDB rather than in the browser.
+export async function getRequestsByStatus(status, filter) {
+  const statuses = Array.isArray(status) ? status : [status];
+  let data = [];
+  try {
+    for (const s of statuses) {
+      let nextToken = null;
+      do {
+        const variables = { status: s, nextToken };
+        if (filter) variables.filter = filter;
+        const requests = await API.graphql(
+          graphqlOperation(requestByStatus, variables)
+        );
+        data = data.concat(requests.data.requestByStatus.items);
+        nextToken = requests.data.requestByStatus.nextToken;
+      } while (nextToken);
+    }
+    return data;
+  } catch (err) {
+    console.log("error fetching requests by status", err);
+    return { error: err };
+  }
+}
+
+// Active sessions for the given user: the "scheduled" and "in progress"
+// partitions, limited to rows the user owns or can approve.
+export async function getActiveSessions(user) {
+  return getRequestsByStatus(["scheduled", "in progress"], {
+    or: [{ email: { eq: user } }, { approvers: { contains: user } }],
+  });
+}
+
 export async function getRequest(id) {
   try {
     const request = await API.graphql(
@@ -212,6 +250,17 @@ export async function sessions(filter) {
     console.log("error fetching sessions");
     return {"error":err}
   }
+}
+
+// Pending approvals queue for the given approver: the "pending" partition,
+// limited to requests the user did not raise but is an eligible approver for.
+export async function getPendingRequests(userEmail) {
+  return getRequestsByStatus("pending", {
+    and: [
+      { email: { ne: userEmail } },
+      { approvers: { contains: userEmail } },
+    ],
+  });
 }
 
 export async function fetchLogs(args) {
@@ -416,7 +465,16 @@ export async function getSetting(id) {
     let data = await request.data.getSettings;
     return data;
   } catch (err) {
+    // Non-admin users are not authorized to read admin-only Settings fields
+    // (e.g. slackToken). AppSync returns the remaining Settings fields together
+    // with a field-level authorization error, which the Amplify client surfaces
+    // as a thrown response. Return that partial data so the request/approval UI
+    // keeps working while the restricted field stays hidden (null).
+    if (err?.data?.getSettings) {
+      return err.data.getSettings;
+    }
     console.log("error fetching settings");
+    return null;
   }
 }
 
@@ -446,5 +504,46 @@ export async function revokePim(data) {
     updateRequests(data).then(() => {});
   } catch (err) {
     console.log("error revoking request");
+  }
+}
+
+export async function invalidateOUCache(ouIds) {
+  try {
+    const mutation = `
+      mutation InvalidateOUCache($ouIds: [String]!) {
+        invalidateOUCache(ouIds: $ouIds) {
+          invalidated
+          failed
+          message
+        }
+      }
+    `;
+    const response = await API.graphql(
+      graphqlOperation(mutation, { ouIds })
+    );
+    return response.data.invalidateOUCache;
+  } catch (err) {
+    console.log("error invalidating OU cache", err);
+    throw err;
+  }
+}
+
+export async function validateRequest(accountId, roleId, userId, groupIds) {
+  try {
+    const mutation = `
+      mutation ValidateRequest($accountId: String!, $roleId: String!, $userId: String!, $groupIds: [String]!) {
+        validateRequest(accountId: $accountId, roleId: $roleId, userId: $userId, groupIds: $groupIds) {
+          valid
+          reason
+        }
+      }
+    `;
+    const response = await API.graphql(
+      graphqlOperation(mutation, { accountId, roleId, userId, groupIds })
+    );
+    return response.data.validateRequest;
+  } catch (err) {
+    console.log("error validating request", err);
+    throw err;
   }
 }
